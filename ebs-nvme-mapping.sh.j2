@@ -1,0 +1,47 @@
+#!/bin/bash
+
+PATH="${PATH}:/usr/sbin"
+
+apt update && apt install -y nvme-cli lshw awscli
+mkdir -p {{ mountPath }}
+
+azabzone=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+region=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+instanceid=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+
+echo "Attaching volume to the instance"
+aws ec2 --region $region attach-volume --volume-id {{ ebsVolumeId }} --instance-id $instanceid --device {{ targetDevice }}
+echo "Sleeping for 30s. To allow time for the volume to be attached to this instance"
+sleep 30 # allowing for a long enough time while the volume mounts. Probably 30s is on the safe side
+# Scratch mount is the device which will be mounted on {{ mountPath }}
+# and generally used for logs, core dumps etc.
+if ! $(mount | grep -q {{ mountPath }}); then
+  # Detected NVME drives
+  # They do not always have a consistent drive number, this will scan for the drives slot in the hypervisor
+  # and mount the correct ones, with sda1 always being the base disk and sdb being the extra, larger, disk
+  if lshw | grep nvme &>/dev/null; then
+    for blkdev in $(nvme list | awk '/^\/dev/ { print $1 }'); do
+      mapping=$(nvme id-ctrl --raw-binary "${blkdev}" | cut -c3073-3104 | tr -s ' ' | sed 's/ $//g')
+      if [[ ${mapping} == "sda1" ]]; then
+        echo "$blkdev is $mapping skipping..."
+      elif [[ ${mapping} == "{{ targetDevice }}" ]]; then
+        echo "$blkdev is $mapping formatting and mounting..."
+        blkid --match-token TYPE=ext4 ${blkdev} || mkfs.ext4 -m0 ${blkdev}
+        echo "Disk formatted. Now initializing the block device with home contents"
+        mkdir -p /data{{ mountPath }}
+        mount ${blkdev} /data{{ mountPath }}
+        cp -aR {{ mountPath }}/* /data{{ mountPath }}/
+        rm -rf {{ mountPath }}/*
+        umount ${blkdev} /data{{ mountPath }}
+        rm -rf /data{{ mountPath }}
+        echo "${blkdev}    {{ mountPath }} ext4    defaults,comment=home-directory-cloudconfig    0    2" >>/etc/fstab
+        mount ${blkdev}
+      else
+        echo "detected unknown drive letter $blkdev: $mapping. Skipping..."
+      fi
+    done
+  fi
+else
+  echo "detected drive already mounted to {{ mountPath }}, skipping mount..."
+  lsblk | grep {{ mountPath }}
+fi
